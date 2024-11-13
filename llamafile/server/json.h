@@ -16,9 +16,15 @@
 // limitations under the License.
 
 #pragma once
-#include <ctl/map.h>
-#include <ctl/string.h>
-#include <ctl/vector.h>
+#include <map>
+#include <string>
+#include <vector>
+
+#if __cplusplus >= 201703L
+#define JSON_STRING_VIEW_ std::string_view
+#else
+#define JSON_STRING_VIEW_ std::string
+#endif
 
 class Json
 {
@@ -28,7 +34,6 @@ class Json
         Null,
         Bool,
         Long,
-        Ulong,
         Float,
         Double,
         String,
@@ -71,7 +76,6 @@ class Json
         object_key_must_be_string,
         c1_control_code_in_string,
         non_del_c0_control_code_in_string,
-        json_payload_should_be_object_or_array,
     };
 
   private:
@@ -79,28 +83,24 @@ class Json
     union
     {
         bool bool_value;
-        long long_value;
         float float_value;
         double double_value;
-        ctl::string string_value;
-        unsigned long ulong_value;
-        ctl::vector<Json> array_value;
-        ctl::map<ctl::string, Json> object_value;
+        long long long_value;
+        std::string string_value;
+        std::vector<Json> array_value;
+        std::map<std::string, Json> object_value;
     };
 
   public:
     static const char* StatusToString(Status);
-    static ctl::pair<Status, Json> parse(const ctl::string_view&);
+    static std::pair<Status, Json> parse(const JSON_STRING_VIEW_&);
 
     Json(const Json&);
     Json(Json&&) noexcept;
+    Json(unsigned long long);
+    ~Json();
 
-    ~Json()
-    {
-        clear();
-    }
-
-    Json(const nullptr_t = nullptr) : type_(Null)
+    Json(const std::nullptr_t = nullptr) : type_(Null)
     {
     }
 
@@ -108,7 +108,19 @@ class Json
     {
     }
 
+    Json(int value) : type_(Long), long_value(value)
+    {
+    }
+
     Json(float value) : type_(Float), float_value(value)
+    {
+    }
+
+    Json(unsigned value) : type_(Long), long_value(value)
+    {
+    }
+
+    Json(long long value) : type_(Long), long_value(value)
     {
     }
 
@@ -116,35 +128,15 @@ class Json
     {
     }
 
-    Json(int value) : type_(Long), long_value(value)
-    {
-    }
-
-    Json(long value) : type_(Long), long_value(value)
-    {
-    }
-
-    Json(unsigned value) : type_(Ulong), ulong_value(value)
-    {
-    }
-
-    Json(unsigned long value) : type_(Ulong), ulong_value(value)
-    {
-    }
-
     Json(const char* value) : type_(String), string_value(value)
     {
     }
 
-    Json(ctl::string&& value) : type_(String), string_value(ctl::move(value))
+    Json(std::string&& value) : type_(String), string_value(std::move(value))
     {
     }
 
-    Json(const ctl::string& value) : type_(String), string_value(value)
-    {
-    }
-
-    Json(const ctl::string_view& value) : type_(String), string_value(value)
+    Json(const JSON_STRING_VIEW_& value) : type_(String), string_value(value)
     {
     }
 
@@ -165,22 +157,12 @@ class Json
 
     bool isNumber() const
     {
-        return isFloat() || isDouble() || isInteger();
-    }
-
-    bool isInteger() const
-    {
-        return isLong() || isUlong();
+        return isFloat() || isDouble() || isLong();
     }
 
     bool isLong() const
     {
         return type_ == Long;
-    }
-
-    bool isUlong() const
-    {
-        return type_ == Ulong;
     }
 
     bool isFloat() const
@@ -209,45 +191,43 @@ class Json
     }
 
     bool getBool() const;
-    long getLong() const;
     float getFloat() const;
     double getDouble() const;
     double getNumber() const;
-    unsigned long getUlong() const;
-    ctl::string& getString();
-    ctl::vector<Json>& getArray();
-    ctl::map<ctl::string, Json>& getObject();
+    long long getLong() const;
+    std::string& getString();
+    std::vector<Json>& getArray();
+    std::map<std::string, Json>& getObject();
 
     void setNull();
     void setBool(bool);
-    void setLong(long);
     void setFloat(float);
     void setDouble(double);
+    void setLong(long long);
     void setString(const char*);
-    void setUlong(unsigned long);
-    void setString(ctl::string&&);
-    void setString(const ctl::string&);
-    void setString(const ctl::string_view&);
+    void setString(std::string&&);
+    void setString(const JSON_STRING_VIEW_&);
     void setArray();
     void setObject();
 
-    ctl::string toString(bool pretty = false) const noexcept;
+    std::string toString() const;
+    std::string toStringPretty() const;
 
     Json& operator=(const Json&);
     Json& operator=(Json&&) noexcept;
 
-    Json& operator[](size_t) noexcept;
-    Json& operator[](const ctl::string&) noexcept;
+    Json& operator[](size_t);
+    Json& operator[](const std::string&);
 
-    operator ctl::string() const noexcept
+    operator std::string() const
     {
         return toString();
     }
 
   private:
     void clear();
-    void marshal(ctl::string&, bool, int) const noexcept;
-    static void stringify(ctl::string&, const ctl::string_view&) noexcept;
-    static void serialize(ctl::string&, const ctl::string_view&) noexcept;
+    void marshal(std::string&, bool, int) const;
+    static void stringify(std::string&, const JSON_STRING_VIEW_&);
+    static void serialize(std::string&, const JSON_STRING_VIEW_&);
     static Status parse(Json&, const char*&, const char*, int, int);
 };

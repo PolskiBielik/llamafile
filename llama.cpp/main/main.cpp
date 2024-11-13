@@ -18,6 +18,7 @@
 #include <cosmo.h>
 
 #include "llamafile/version.h"
+#include "llamafile/chatbot.h"
 #include "llama.cpp/llama.h"
 #include "llama.cpp/string.h"
 #include "llama.cpp/common.h"
@@ -194,17 +195,15 @@ int main(int argc, char ** argv) {
 
     enum Program prog = determine_program(argv);
 
-    if (prog == SERVER ||
+    if (prog == SERVER)
+        return server_cli(argc, argv);
+
+    if (prog == CHATBOT ||
         (prog == UNKNOWN &&
          !llamafile_has(argv, "-p") &&
          !llamafile_has(argv, "-f") &&
          !llamafile_has(argv, "--random-prompt"))) {
-        return server_cli(argc, argv);
-    }
-
-    if (prog == CHATBOT) {
-        int chatbot_main(int, char **);
-        return chatbot_main(argc, argv);
+        return lf::chatbot::main(argc, argv);
     }
 
     if (prog == EMBEDDING) {
@@ -236,7 +235,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!FLAG_unsecure && !llamafile_has_gpu()) {
+    if (!FLAG_unsecure && !llamafile_has_gpu() && !g_server_background_mode) {
         // Enable pledge() security on Linux and OpenBSD.
         // - We do this *after* opening the log file for writing.
         // - We do this *before* loading any weights or graphdefs.
