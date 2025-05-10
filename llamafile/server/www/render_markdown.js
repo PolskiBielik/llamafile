@@ -223,11 +223,18 @@ class RenderMarkdown extends Highlighter {
       const c = input[i];
       if (c == '\r')
         continue;
+      if (c == '\u0000')
+        c = '\ufffd';
       switch (this.state) {
 
       case RenderMarkdown.NORMAL:
-        if (this.bol && this.spaces == 4 && this.newlines >= 2 &&
-            isgraph(c) && c != '`' && !this.style.length) {
+        if (this.bol &&
+            this.spaces >= 4 &&
+            this.newlines >= 2 &&
+            isgraph(c) &&
+            c != '`' &&
+            (!this.style.length ||
+             this.spaces >= this.style[this.style.length - 1][1] + 4)) {
           this.dedent = this.spaces;
           this.spaces = 0;
           this.bol = false;
@@ -290,7 +297,7 @@ class RenderMarkdown extends Highlighter {
           ++this.spaces;
           this.append(c);
         } else if (c == '\t') {
-          this.spaces = (this.spaces + 3) & -4;
+          this.spaces = (this.spaces + 4) & -4;
           this.append(c);
         } else {
           this.got();
@@ -306,7 +313,7 @@ class RenderMarkdown extends Highlighter {
         } else if (c == ' ') {
           ++this.spaces;
         } else if (c == '\t') {
-          this.spaces = (this.spaces + 3) & -4;
+          this.spaces = (this.spaces + 4) & -4;
         } else {
           if (this.newlines >= 2) {
             if (this.style.length &&
@@ -410,6 +417,10 @@ class RenderMarkdown extends Highlighter {
       case RenderMarkdown.BACKSLASH:
         if (ispunct(c)) {
           this.append(c);
+          this.state = RenderMarkdown.NORMAL;
+        } else if (c == '\n') {
+          this.push("BR", "");
+          this.pop();
           this.state = RenderMarkdown.NORMAL;
         } else {
           this.append('\\');
@@ -639,7 +650,7 @@ class RenderMarkdown extends Highlighter {
             if (this.spaces <= this.dedent)
               break;
           } else if (c == '\t') {
-            this.spaces = (this.spaces + 3) & -4;
+            this.spaces = (this.spaces + 4) & -4;
             if (this.spaces <= this.dedent)
               break;
           } else {
@@ -773,7 +784,7 @@ class RenderMarkdown extends Highlighter {
             if (this.spaces <= this.dedent)
               break;
           } else if (c == '\t') {
-            this.spaces = (this.spaces + 3) & -4;
+            this.spaces = (this.spaces + 4) & -4;
             if (this.spaces <= this.dedent)
               break;
           } else {
@@ -904,48 +915,7 @@ class RenderMarkdown extends Highlighter {
     this.tick2 = 0;
   }
 
-  static COPY_BUTTON = null;
-
-  static makeCopyButton() {
-    if (!RenderMarkdown.COPY_BUTTON) {
-      RenderMarkdown.COPY_BUTTON = document.createElement('button');
-      RenderMarkdown.COPY_BUTTON.className = 'copy-button';
-      RenderMarkdown.COPY_BUTTON.innerHTML =
-        `<svg xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 24 24" fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round">
-           <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-           <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-         </svg>`;
-    }
-    return RenderMarkdown.COPY_BUTTON.cloneNode(true);
-  }
-
   setupCodeBlock(pre) {
-    const copyButton = RenderMarkdown.makeCopyButton();
-    copyButton.addEventListener('click', function() {
-      try {
-        copyTextToClipboard(pre.innerText);
-        const originalInnerHTML = copyButton.innerHTML;
-        copyButton.innerHTML =
-          `<svg xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24" fill="none"
-                stroke="green"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round">
-             <polyline points="20 6 9 17 4 12"></polyline>
-           </svg>`;
-        setTimeout(() => {
-          copyButton.innerHTML = originalInnerHTML;
-        }, 2000);
-      } catch (err) {
-        console.error('Failed to copy text:', err);
-      }
-    });
-    pre.appendChild(copyButton);
+    pre.appendChild(createCopyButton(() => pre.innerText));
   }
 }

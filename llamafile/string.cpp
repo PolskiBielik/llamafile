@@ -52,17 +52,6 @@ bool startscasewith(const std::string_view &str, const std::string_view &prefix)
     return true;
 }
 
-void append_wchar(std::string *r, wchar_t c) {
-    if (isascii(c)) {
-        *r += c;
-    } else {
-        char s[8];
-        uint64_t w = tpenc(c);
-        WRITE64LE(s, w);
-        *r += s;
-    }
-}
-
 std::string format(const char *fmt, ...) {
     va_list ap, ap2;
     va_start(ap, fmt);
@@ -100,6 +89,14 @@ std::string basename(const std::string_view &path) {
     } else {
         return ".";
     }
+}
+
+std::string stripext(const std::string &path) {
+    size_t i = path.size();
+    while (i--)
+        if (path[i] == '.')
+            return path.substr(0, i);
+    return path;
 }
 
 std::string_view extname(const std::string_view &path) {

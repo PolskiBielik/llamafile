@@ -27,6 +27,8 @@
 #include "llama.cpp/ggml-metal.h"
 #include "llama.cpp/llava/llava.h"
 #include "llama.cpp/server/server.h"
+#include "localscore/localscore.h"
+#include "llamafile/server/prog.h"
 
 static llama_context           ** g_ctx;
 static llama_model             ** g_model;
@@ -36,9 +38,6 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
-
-extern "C" int nsync_futex_wake_(int *, int, char);
-extern "C" int nsync_futex_wait_(int *, int, char, const struct timespec *);
 
 static bool file_exists(const std::string & path) {
     std::ifstream f(path.c_str());
@@ -100,7 +99,7 @@ static int is_killed;
 
 static void *safe_sigint_handler(void *arg) {
     while (!is_killed)
-        nsync_futex_wait_(&is_killed, 0, 0, 0);
+        cosmo_futex_wait(&is_killed, 0, 0, 0, 0);
     console::cleanup();
     printf("\n");
     llama_print_timings(*g_ctx);
@@ -125,7 +124,7 @@ static void sigint_handler(int signo) {
             is_interacting = true;
         } else {
             is_killed = true;
-            nsync_futex_wake_(&is_killed, 1, 0);
+            cosmo_futex_wake(&is_killed, 1, 0);
             for (;;) {
             }
         }
@@ -153,9 +152,12 @@ enum Program {
     SERVER,
     CHATBOT,
     EMBEDDING,
+    LLAMAFILER,
+    LOCALSCORE
 };
 
 enum Program determine_program(char *argv[]) {
+    bool v2 = false;
     enum Program prog = UNKNOWN;
     for (int i = 0; argv[i]; ++i) {
         if (!strcmp(argv[i], "--cli")) {
@@ -166,16 +168,20 @@ enum Program determine_program(char *argv[]) {
             prog = SERVER;
         } else if (!strcmp(argv[i], "--embedding")) {
             prog = EMBEDDING;
+        } else if (!strcmp(argv[i], "--v2")) {
+            v2 = true;
+        } else if (!strcmp(argv[i], "--localscore")) {
+            prog = LOCALSCORE;
         }
+    }
+    if (prog == SERVER && v2) {
+        prog = LLAMAFILER;
     }
     return prog;
 }
 
 int main(int argc, char ** argv) {
-
-    mallopt(M_GRANULARITY, 2 * 1024 * 1024);
-    mallopt(M_MMAP_THRESHOLD, 16 * 1024 * 1024);
-    mallopt(M_TRIM_THRESHOLD, 128 * 1024 * 1024);
+    llamafile_check_cpu();
 
     if (llamafile_has(argv, "--version")) {
         puts("llamafile v" LLAMAFILE_VERSION_STRING);
@@ -185,15 +191,23 @@ int main(int argc, char ** argv) {
     if (llamafile_has(argv, "-h") ||
         llamafile_has(argv, "-help") ||
         llamafile_has(argv, "--help")) {
-        llamafile_help("/zip/llama.cpp/main/main.1.asc");
+        if (llamafile_has(argv, "--v2")) {
+            llamafile_help("/zip/llamafile/server/main.1.asc");
+        } else {
+            llamafile_help("/zip/llama.cpp/main/main.1.asc");
+        }
         __builtin_unreachable();
     }
 
-    llamafile_check_cpu();
-    ShowCrashReports();
-    LoadZipArgs(&argc, &argv);
-
     enum Program prog = determine_program(argv);
+    if (prog == LLAMAFILER)
+        return lf::server::main(argc, argv);
+
+    mallopt(M_GRANULARITY, 2 * 1024 * 1024);
+    mallopt(M_MMAP_THRESHOLD, 16 * 1024 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 128 * 1024 * 1024);
+    ShowCrashReports();
+    argc = cosmo_args("/zip/.args", &argv);
 
     if (prog == SERVER)
         return server_cli(argc, argv);
@@ -209,6 +223,10 @@ int main(int argc, char ** argv) {
     if (prog == EMBEDDING) {
         int embedding_cli(int, char **);
         return embedding_cli(argc, argv);
+    }
+
+    if (prog == LOCALSCORE) {
+        return localscore_cli(argc, argv);
     }
 
     launch_sigint_thread();

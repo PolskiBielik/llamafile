@@ -32,9 +32,9 @@ Client::slotz()
     int id = atoi(s.c_str());
     if (id < 0)
         return send_error(400);
-    if (id >= worker_->server_->slots_->all_slots_.size())
+    if (id >= worker_->server_->slots_->size())
         return send_error(404);
-    Slot* slot = worker_->server_->slots_->all_slots_[id];
+    Slot* slot = worker_->server_->slots_->slots_[id].get();
     std::string dump;
     slot->dump(&dump);
     char* p = append_http_response_message(obuf_.p, 200);

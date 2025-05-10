@@ -38,11 +38,13 @@
 
 bool FLAGS_READY = false;
 bool FLAG_ascii = false;
+bool FLAG_completion_mode = false;
 bool FLAG_fast = false;
 bool FLAG_iq = false;
 bool FLAG_log_disable = false;
 bool FLAG_mlock = false;
 bool FLAG_mmap = true;
+bool FLAG_no_display_prompt = false;
 bool FLAG_nocompile = false;
 bool FLAG_nologo = false;
 bool FLAG_precise = false;
@@ -50,6 +52,11 @@ bool FLAG_recompile = false;
 bool FLAG_tinyblas = false;
 bool FLAG_trace = false;
 bool FLAG_unsecure = false;
+bool FLAG_v2 = false;
+const char *FLAG_chat_template = "";
+const char *FLAG_db = nullptr;
+const char *FLAG_db_startup_sql = "PRAGMA journal_mode=WAL;"
+                                  "PRAGMA synchronous=NORMAL;";
 const char *FLAG_file = nullptr;
 const char *FLAG_ip_header = nullptr;
 const char *FLAG_listen = "127.0.0.1:8080";
@@ -59,9 +66,15 @@ const char *FLAG_prompt = nullptr;
 const char *FLAG_url_prefix = "";
 const char *FLAG_www_root = "/zip/www";
 double FLAG_token_rate = 1;
-float FLAG_temp = 0.8;
-int FLAG_batch = 2048;
+float FLAG_decay_growth = .01;
+float FLAG_frequency_penalty = 0;
+float FLAG_presence_penalty = 0;
+float FLAG_reserve_tokens = .15;
+float FLAG_temperature = .8;
+float FLAG_top_p = .95;
+int FLAG_batch = 256;
 int FLAG_ctx_size = 8192;
+int FLAG_decay_delay = 60 * 5;
 int FLAG_flash_attn = false;
 int FLAG_gpu = 0;
 int FLAG_http_ibuf_size = 5 * 1024 * 1024;
@@ -69,7 +82,6 @@ int FLAG_http_obuf_size = 1024 * 1024;
 int FLAG_keepalive = 5;
 int FLAG_main_gpu = 0;
 int FLAG_n_gpu_layers = -1;
-int FLAG_seed = LLAMA_DEFAULT_SEED;
 int FLAG_slots = 1;
 int FLAG_split_mode = LLAMA_SPLIT_MODE_LAYER;
 int FLAG_threads = MIN(cpu_get_num_math(), 20);
@@ -80,6 +92,7 @@ int FLAG_ubatch = 512;
 int FLAG_verbose = 0;
 int FLAG_warmup = true;
 int FLAG_workers;
+unsigned FLAG_seed = LLAMA_DEFAULT_SEED;
 
 std::vector<std::string> FLAG_headers;
 
@@ -119,6 +132,11 @@ static wontreturn void unknown(const char *flag) {
     exit(1);
 }
 
+static bool is_valid_chat_template(const char *tmpl) {
+    llama_chat_message chat[] = {{"user", "test"}};
+    return llama_chat_apply_template(nullptr, tmpl, chat, 1, true, nullptr, 0) >= 0;
+}
+
 void llamafile_get_flags(int argc, char **argv) {
     bool program_supports_gpu = FLAG_gpu != LLAMAFILE_GPU_DISABLE;
     for (int i = 1; i < argc;) {
@@ -143,6 +161,11 @@ void llamafile_get_flags(int argc, char **argv) {
         //////////////////////////////////////////////////////////////////////
         // chatbot flags
 
+        if (!strcmp(flag, "--v2")) {
+            FLAG_v2 = true;
+            continue;
+        }
+
         if (!strcmp(flag, "--ascii")) {
             FLAG_ascii = true;
             continue;
@@ -153,8 +176,53 @@ void llamafile_get_flags(int argc, char **argv) {
             continue;
         }
 
+        if (!strcmp(flag, "--chatbot-mode")) {
+            FLAG_completion_mode = false;
+            continue;
+        }
+
+        if (!strcmp(flag, "--completion-mode")) {
+            FLAG_completion_mode = true;
+            continue;
+        }
+
+        if (!strcmp(flag, "--no-display-prompt") || //
+            !strcmp(flag, "--silent-prompt")) {
+            FLAG_no_display_prompt = true;
+            continue;
+        }
+
+        if (!strcmp(flag, "--display-prompt")) {
+            FLAG_no_display_prompt = false;
+            continue;
+        }
+
+        if (!strcmp(flag, "--prompt") || !strcmp(flag, "--system-prompt")) {
+            if (i == argc)
+                missing("--prompt");
+            FLAG_prompt = argv[i++];
+            continue;
+        }
+
+        if (!strcmp(flag, "--db")) {
+            if (i == argc)
+                missing("--db");
+            FLAG_db = argv[i++];
+            continue;
+        }
+
+        if (!strcmp(flag, "--db-startup-sql")) {
+            if (i == argc)
+                missing("--db-startup-sql");
+            FLAG_db_startup_sql = argv[i++];
+            continue;
+        }
+
         //////////////////////////////////////////////////////////////////////
         // server flags
+
+        if (!strcmp(flag, "--server"))
+            continue;
 
         if (!strcmp(flag, "-l") || !strcmp(flag, "--listen")) {
             if (i == argc)
@@ -279,6 +347,45 @@ void llamafile_get_flags(int argc, char **argv) {
         }
 
         //////////////////////////////////////////////////////////////////////
+        // sampling flags
+
+        if (!strcmp(flag, "--seed")) {
+            if (i == argc)
+                missing("--seed");
+            FLAG_seed = strtol(argv[i++], 0, 0);
+            continue;
+        }
+
+        if (!strcmp(flag, "--temp") || //
+            !strcmp(flag, "--temperature")) {
+            if (i == argc)
+                missing("--temp");
+            FLAG_temperature = atof(argv[i++]);
+            continue;
+        }
+
+        if (!strcmp(flag, "--top-p")) {
+            if (i == argc)
+                missing("--top-p");
+            FLAG_top_p = atof(argv[i++]);
+            continue;
+        }
+
+        if (!strcmp(flag, "--frequency-penalty")) {
+            if (i == argc)
+                missing("--frequency-penalty");
+            FLAG_frequency_penalty = atof(argv[i++]);
+            continue;
+        }
+
+        if (!strcmp(flag, "--presence-penalty")) {
+            if (i == argc)
+                missing("--presence-penalty");
+            FLAG_presence_penalty = atof(argv[i++]);
+            continue;
+        }
+
+        //////////////////////////////////////////////////////////////////////
         // model flags
 
         if (!strcmp(flag, "-c") || !strcmp(flag, "--ctx-size")) {
@@ -291,10 +398,12 @@ void llamafile_get_flags(int argc, char **argv) {
             continue;
         }
 
-        if (!strcmp(flag, "-s") || !strcmp(flag, "--slots")) {
+        if (!strcmp(flag, "--chat-template")) {
             if (i == argc)
-                missing("--slots");
-            FLAG_slots = atoi(argv[i++]);
+                missing("--chat-template");
+            if (!is_valid_chat_template(argv[i]))
+                bad("--chat-template");
+            FLAG_chat_template = argv[i++];
             continue;
         }
 
@@ -316,20 +425,6 @@ void llamafile_get_flags(int argc, char **argv) {
             if (i == argc)
                 missing("--file");
             FLAG_file = argv[i++];
-            continue;
-        }
-
-        if (!strcmp(flag, "--seed")) {
-            if (i == argc)
-                missing("--seed");
-            FLAG_seed = atoi(argv[i++]);
-            continue;
-        }
-
-        if (!strcmp(flag, "--temp")) {
-            if (i == argc)
-                missing("--temp");
-            FLAG_temp = atof(argv[i++]);
             continue;
         }
 
@@ -370,6 +465,54 @@ void llamafile_get_flags(int argc, char **argv) {
 
         if (!strcmp(flag, "--no-warmup")) {
             FLAG_warmup = false;
+            continue;
+        }
+
+        if (!strcmp(flag, "--reserve-tokens")) {
+            if (i == argc)
+                missing("--reserve-tokens");
+            const char *s = argv[i++];
+            if (strchr(s, '.')) {
+                float f = atof(s);
+                if (!(0 < f && f <= 1))
+                    error("--reserve-tokens FLOAT must be on the interval (0,1]");
+                FLAG_reserve_tokens = f;
+            } else {
+                int n = atoi(s);
+                if (!(1 <= n && n <= 100))
+                    error("--reserve-tokens INT must be between 1 and 100");
+                FLAG_reserve_tokens = n / 100.;
+            }
+            continue;
+        }
+
+        //////////////////////////////////////////////////////////////////////
+        // resource management flags
+
+        if (!strcmp(flag, "-s") || !strcmp(flag, "--slots")) {
+            if (i == argc)
+                missing("--slots");
+            FLAG_slots = atoi(argv[i++]);
+            continue;
+        }
+
+        if (!strcmp(flag, "--decay-delay")) {
+            if (i == argc)
+                missing("--decay-delay");
+            int n = atoi(argv[i++]);
+            if (!(0 <= n && n <= 31536000))
+                error("--decay-delay INT must be between 1 and 31536000");
+            FLAG_decay_delay = n;
+            continue;
+        }
+
+        if (!strcmp(flag, "--decay-growth")) {
+            if (i == argc)
+                missing("--decay-growth");
+            float n = atof(argv[i++]);
+            if (!(isnormal(n) && n > 0))
+                error("--decay-growth FLOAT must be greater than 0");
+            FLAG_decay_growth = n;
             continue;
         }
 

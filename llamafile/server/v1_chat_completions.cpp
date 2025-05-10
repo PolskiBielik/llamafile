@@ -18,12 +18,12 @@
 #include "client.h"
 #include "llama.cpp/llama.h"
 #include "llama.cpp/sampling.h"
+#include "llamafile/json.h"
 #include "llamafile/llama.h"
 #include "llamafile/macros.h"
 #include "llamafile/server/atom.h"
 #include "llamafile/server/cleanup.h"
 #include "llamafile/server/fastjson.h"
-#include "llamafile/server/json.h"
 #include "llamafile/server/log.h"
 #include "llamafile/server/server.h"
 #include "llamafile/server/slot.h"
@@ -32,10 +32,13 @@
 #include "llamafile/server/worker.h"
 #include "llamafile/string.h"
 #include "llamafile/vector.h"
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <sys/resource.h>
 #include <vector>
+
+using jt::Json;
 
 namespace lf {
 namespace server {
@@ -43,6 +46,7 @@ namespace server {
 struct V1ChatCompletionParams
 {
     bool stream = false;
+    bool stream_include_usage = false;
     long max_tokens = -1;
     long seed = _rand64();
     double top_p = 1;
@@ -74,7 +78,7 @@ struct V1ChatCompletionState
 {
     std::string prompt;
     std::vector<Atom> atoms;
-    std::string piece;
+    std::string piece = "";
 };
 
 struct V1ChatCompletionResponse
@@ -161,6 +165,24 @@ make_event(const Json& json)
     return s;
 }
 
+static int
+has_images(const std::vector<Atom>& atoms)
+{
+    for (const Atom& atom : atoms)
+        if (atom.is_image())
+            return true;
+    return false;
+}
+
+static int
+count_bytes(const std::vector<llama_chat_msg>& messages)
+{
+    int n = 0;
+    for (const llama_chat_msg& message : messages)
+        n += message.content.size();
+    return n;
+}
+
 bool
 Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
 {
@@ -177,42 +199,42 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
         return false;
 
     // object<model, messages, ...>
-    std::pair<Json::Status, Json> json = Json::parse(payload_);
-    if (json.first != Json::success)
-        return send_error(400, Json::StatusToString(json.first));
-    if (!json.second.isObject())
+    auto [status, json] = Json::parse(std::string(payload_));
+    if (status != Json::success)
+        return send_error(400, Json::StatusToString(status));
+    if (!json.isObject())
         return send_error(400, "JSON body must be an object");
 
     // fields openai documents that we don't support yet
-    if (!json.second["tools"].isNull())
+    if (json.contains("tools"))
         return send_error(400, "OpenAI tools field not supported yet");
-    if (!json.second["audio"].isNull())
+    if (json.contains("audio"))
         return send_error(400, "OpenAI audio field not supported yet");
-    if (!json.second["logprobs"].isNull())
+    if (json.contains("logprobs"))
         return send_error(400, "OpenAI logprobs field not supported yet");
-    if (!json.second["functions"].isNull())
+    if (json.contains("functions"))
         return send_error(400, "OpenAI functions field not supported yet");
-    if (!json.second["modalities"].isNull())
+    if (json.contains("modalities"))
         return send_error(400, "OpenAI modalities field not supported yet");
-    if (!json.second["tool_choice"].isNull())
+    if (json.contains("tool_choice"))
         return send_error(400, "OpenAI tool_choice field not supported yet");
-    if (!json.second["top_logprobs"].isNull())
+    if (json.contains("top_logprobs"))
         return send_error(400, "OpenAI top_logprobs field not supported yet");
-    if (!json.second["function_call"].isNull())
+    if (json.contains("function_call"))
         return send_error(400, "OpenAI function_call field not supported yet");
-    if (!json.second["parallel_tool_calls"].isNull())
+    if (json.contains("parallel_tool_calls"))
         return send_error(400, "parallel_tool_calls field not supported yet");
 
     // model: string
-    Json& model = json.second["model"];
+    Json& model = json["model"];
     if (!model.isString())
         return send_error(400, "JSON missing model string");
-    params->model = std::move(model.getString());
+    params->model = model.getString();
 
     // messages: array<object<role:string, content:string>>
-    if (!json.second["messages"].isArray())
+    if (!json["messages"].isArray())
         return send_error(400, "JSON missing messages array");
-    std::vector<Json>& messages = json.second["messages"].getArray();
+    std::vector<Json>& messages = json["messages"].getArray();
     if (messages.empty())
         return send_error(400, "JSON messages array is empty");
     for (Json& message : messages) {
@@ -224,9 +246,10 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
             return send_error(400, "message role not system user assistant");
         if (!message["content"].isString())
             return send_error(400, "message must have string content");
-        params->messages.emplace_back(
-          std::move(message["role"].getString()),
-          std::move(message["content"].getString()));
+        if (message["content"].getString().empty())
+            return send_error(400, "message must not have empty content");
+        params->messages.emplace_back(message["role"].getString(),
+                                      message["content"].getString());
     }
 
     // n: integer|null
@@ -235,7 +258,7 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
     // message. Note that you will be charged based on the number of
     // generated tokens across all of the choices. Keep n as 1 to
     // minimize costs.
-    Json& n = json.second["n"];
+    Json& n = json["n"];
     if (!n.isNull()) {
         if (!n.isLong())
             return send_error(400, "n field must be integer");
@@ -249,24 +272,44 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
     // Tokens will be sent as data-only server-sent events as they
     // become available, with the stream terminated by a data: [DONE]
     // message.
-    Json& stream = json.second["stream"];
+    Json& stream = json["stream"];
     if (!stream.isNull()) {
         if (!stream.isBool())
             return send_error(400, "stream field must be boolean");
         params->stream = stream.getBool();
+
+        // stream_options: object|null
+        //
+        // Options for the streaming response.
+        Json& stream_options = json["stream_options"];
+        if (!stream_options.isNull()) {
+            if (!stream_options.isObject())
+                return send_error(400, "stream_options field must be object");
+
+            // include_usage: bool|null
+            //
+            // Include usage also for streaming responses. The actual usage will be reported before
+            // the [DONE] message, but all chunks contain an empty usage field.
+            Json& include_usage = stream_options["include_usage"];
+            if (!include_usage.isNull()) {
+                if (!include_usage.isBool())
+                    return send_error(400, "include_usage field must be boolean");
+                params->stream_include_usage = include_usage.getBool();
+            }
+        }
     }
 
     // max_tokens: integer|null
     //
     // An upper bound for the number of tokens that can be generated for
     // a completion. This can be used to control compute costs.
-    Json& max_tokens = json.second["max_tokens"];
+    Json& max_tokens = json["max_tokens"];
     if (!max_tokens.isNull()) {
         if (!max_tokens.isLong())
             return send_error(400, "max_tokens must be integer");
         params->max_tokens = max_tokens.getLong();
     }
-    Json& max_completion_tokens = json.second["max_completion_tokens"];
+    Json& max_completion_tokens = json["max_completion_tokens"];
     if (!max_completion_tokens.isNull()) {
         if (!max_completion_tokens.isLong())
             return send_error(400, "max_completion_tokens must be integer");
@@ -281,11 +324,13 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
     // comprising the top 10% probability mass are considered.
     //
     // We generally recommend altering this or temperature but not both.
-    Json& top_p = json.second["top_p"];
+    Json& top_p = json["top_p"];
     if (!top_p.isNull()) {
         if (!top_p.isNumber())
             return send_error(400, "top_p must be number");
         params->top_p = top_p.getNumber();
+        if (!(0 <= params->top_p && params->top_p <= 1))
+            return send_error(400, "top_p must be between 0 and 1");
     }
 
     // temperature: number|null
@@ -295,7 +340,7 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
     // like 0.2 will make it more focused and deterministic.
     //
     // We generally recommend altering this or top_p but not both.
-    Json& temperature = json.second["temperature"];
+    Json& temperature = json["temperature"];
     if (!temperature.isNull()) {
         if (!temperature.isNumber())
             return send_error(400, "temperature must be number");
@@ -311,7 +356,7 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
     // and parameters should return the same result. Determinism is not
     // guaranteed, and you should refer to the system_fingerprint
     // response parameter to monitor changes in the backend.
-    Json& seed = json.second["seed"];
+    Json& seed = json["seed"];
     if (!seed.isNull()) {
         if (!seed.isLong())
             return send_error(400, "seed must be integer");
@@ -323,7 +368,7 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
     // Number between -2.0 and 2.0. Positive values penalize new tokens
     // based on whether they appear in the text so far, increasing the
     // model's likelihood to talk about new topics.
-    Json& presence_penalty = json.second["presence_penalty"];
+    Json& presence_penalty = json["presence_penalty"];
     if (!presence_penalty.isNull()) {
         if (!presence_penalty.isNumber())
             return send_error(400, "presence_penalty must be number");
@@ -337,7 +382,7 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
     // Number between -2.0 and 2.0. Positive values penalize new tokens
     // based on their existing frequency in the text so far, decreasing
     // the model's likelihood to repeat the same line verbatim.
-    Json& frequency_penalty = json.second["frequency_penalty"];
+    Json& frequency_penalty = json["frequency_penalty"];
     if (!frequency_penalty.isNull()) {
         if (!frequency_penalty.isNumber())
             return send_error(400, "frequency_penalty must be number");
@@ -351,17 +396,17 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
     //
     // A unique identifier representing your end-user, which can help
     // llamafiler to monitor and detect abuse.
-    Json& user = json.second["user"];
+    Json& user = json["user"];
     if (!user.isNull()) {
         if (!user.isString())
             return send_error(400, "JSON missing user string");
-        params->user = std::move(user.getString());
+        params->user = user.getString();
     }
 
     // stop: string|array<string>|null
     //
     // Up to 4 sequences where the API will stop generating further tokens.
-    Json& stop = json.second["stop"];
+    Json& stop = json["stop"];
     if (!stop.isNull()) {
         if (stop.isString()) {
             params->add_stop(model_, stop.getString());
@@ -403,7 +448,7 @@ Client::get_v1_chat_completions_params(V1ChatCompletionParams* params)
     // may be partially cut off if finish_reason = "length", which
     // indicates the generation exceeded max_tokens or the conversation
     // exceeded the max context length.
-    Json& response_format = json.second["response_format"];
+    Json& response_format = json["response_format"];
     if (!response_format.isNull()) {
         if (response_format.isString()) {
             if (response_format.getString() != "auto")
@@ -453,18 +498,73 @@ Client::v1_chat_completions()
     V1ChatCompletionResponse* response = new V1ChatCompletionResponse;
     defer_cleanup(cleanup_response, response);
 
-    // add bos token if it's needed
-    if (llama_should_add_bos_token(model_))
-        state->atoms.emplace_back(llama_token_bos(model_));
+    // turn prompt into atom array that'll fit in context window
+    for (;;) {
+        // add bos token if it's needed
+        if (llama_should_add_bos_token(model_))
+            state->atoms.emplace_back(llama_token_bos(model_));
 
-    // turn text into tokens
-    state->prompt =
-      llama_chat_apply_template(model_, "", params->messages, ADD_ASSISTANT);
-    atomize(model_, &state->atoms, state->prompt, PARSE_SPECIAL);
+        // turn text into tokens
+        state->prompt = llama_chat_apply_template(
+          model_, FLAG_chat_template, params->messages, ADD_ASSISTANT);
+        atomize(model_, &state->atoms, state->prompt, PARSE_SPECIAL);
 
-    // find appropriate slot
-    slot_ = worker_->server_->slots_->take(state->atoms);
-    defer_cleanup(cleanup_slot, this);
+        // we don't support multiple images yet
+        state->atoms = remove_old_image_atoms(state->atoms);
+
+        // acquire best slot
+        if (!slot_) {
+            slot_ = worker_->server_->slots_->take(state->atoms);
+            defer_cleanup(cleanup_slot, this);
+        }
+
+        // check if image uploading is supported
+        if (!slot_->clip_ctx_ && has_images(state->atoms))
+            return send_error(400, "no_vision_model");
+
+        // check if we have enough context
+        int space = slot_->ctx_size();
+        int avail = space - space * FLAG_reserve_tokens;
+        int need = count_tokens(state->atoms);
+        unassert(avail > 0);
+        if (need <= avail)
+            break;
+
+        // calling atomize() again will append
+        state->atoms.clear();
+
+        // forget old messages to clear up space in context window
+        //
+        // to avoid calling tokenize quadratically, we use a crude byte
+        // count heuristic to determine how many messages to drop. this
+        // is needed since the client sends the whole history each time
+        unassert(!params->messages.empty());
+        int keep_msgs = params->messages[0].role == "system";
+        int max_forget_msgs = (int)params->messages.size() - (keep_msgs + 1);
+        if (max_forget_msgs <= 0) {
+            SLOG("ran out of chat messages to forget");
+            return send_error(400, "out_of_context_due_to_long_message");
+        }
+        int bytes = count_bytes(params->messages);
+        double percent_to_remember = (double)avail / need;
+        int bytes_to_delete = bytes * (1 - percent_to_remember);
+        auto first = params->messages.begin();
+        if (keep_msgs)
+            ++first;
+        auto last = first;
+        int bytes_deleted = 0;
+        int forgotten_msgs = 0;
+        do {
+            bytes_deleted += last->content.size();
+            ++forgotten_msgs;
+            ++last;
+        } while (bytes_deleted < bytes_to_delete &&
+                 forgotten_msgs < max_forget_msgs);
+        SLOG("forgot %d / %zu old messages",
+             forgotten_msgs,
+             params->messages.size());
+        params->messages.erase(first, last);
+    }
 
     // init sampling
     llama_sampling_context* sampler = create_sampler(params);
@@ -472,24 +572,16 @@ Client::v1_chat_completions()
         return send_error(500, "failed to create sampler");
     defer_cleanup(cleanup_sampler, sampler);
 
-    // prefill time
-    int prompt_tokens = 0;
-    if ((prompt_tokens = slot_->prefill(state->atoms)) < 0) {
-        SLOG("slot prefill failed: %s", Slot::describe_error(prompt_tokens));
-        return send_error(500, Slot::describe_error(prompt_tokens));
-    }
-
     // setup response json
-    response->json["id"].setString(generate_id());
-    response->json["object"].setString("chat.completion");
-    response->json["model"].setString(params->model);
-    response->json["system_fingerprint"].setString(slot_->system_fingerprint_);
-    response->json["choices"].setArray();
+    response->json["id"] = generate_id();
+    response->json["object"] = "chat.completion";
+    response->json["model"] = params->model;
+    response->json["x_prefill_progress"] = nullptr;
+    response->json["system_fingerprint"] = slot_->system_fingerprint_;
     Json& choice = response->json["choices"][0];
-    choice.setObject();
-    choice["index"].setLong(0);
-    choice["logprobs"].setNull();
-    choice["finish_reason"].setNull();
+    choice["index"] = 0;
+    choice["logprobs"] = nullptr;
+    choice["finish_reason"] = nullptr;
 
     // initialize response
     if (params->stream) {
@@ -497,10 +589,44 @@ Client::v1_chat_completions()
         p = stpcpy(p, "Content-Type: text/event-stream\r\n");
         if (!send_response_start(obuf_.p, p))
             return false;
-        choice["delta"].setObject();
-        choice["delta"]["role"].setString("assistant");
-        choice["delta"]["content"].setString("");
-        response->json["created"].setLong(timespec_real().tv_sec);
+        choice["delta"]["role"] = "assistant";
+        choice["delta"]["content"] = "";
+        if (params->stream_include_usage)
+            response->json["usage"] = nullptr;
+    }
+
+    // prefill time
+    int prompt_tokens = 0;
+    if (params->stream) {
+        auto progress_callback = [&](int processed, int total) {
+            if (processed < total) {
+                response->json["x_prefill_progress"] =
+                  static_cast<float>(processed) / total;
+                response->json["created"] = timespec_real().tv_sec;
+                response->content = make_event(response->json);
+                if (!send_response_chunk(response->content)) {
+                    return; // Note: Can't properly handle error in callback
+                }
+            }
+        };
+        prompt_tokens = slot_->prefill(state->atoms, progress_callback);
+    } else {
+        prompt_tokens = slot_->prefill(state->atoms);
+    }
+
+    if (prompt_tokens < 0) {
+        SLOG("slot prefill failed: %s", Slot::describe_error(prompt_tokens));
+        if (!params->stream) {
+            return send_error(500, Slot::describe_error(prompt_tokens));
+        } else {
+            close_connection_ = true;
+            return false;
+        }
+    }
+
+    // initialize response
+    if (params->stream) {
+        response->json.getObject().erase("x_prefill_progress");
         response->content = make_event(response->json);
         choice.getObject().erase("delta");
         if (!send_response_chunk(response->content))
@@ -519,7 +645,7 @@ Client::v1_chat_completions()
         llama_token id = llama_sampling_sample(sampler, slot_->ctx_, NULL);
         llama_sampling_accept(sampler, slot_->ctx_, id, APPLY_GRAMMAR);
         ++completion_tokens;
-        if (!slot_->eval_token(id)) {
+        if (slot_->eval_token(id) < 0) {
             SLOG("ran out of context window");
             break;
         }
@@ -532,46 +658,57 @@ Client::v1_chat_completions()
             finish_reason = "stop";
             break;
         }
-        state->piece =
+        state->piece +=
           llamafile_token_to_piece(slot_->ctx_, id, DONT_RENDER_SPECIAL_TOKENS);
         if (!state->piece.empty()) {
             if (params->stream) {
-                char* p = append_http_response_message(obuf_.p, 200);
-                choice["delta"].setObject();
-                choice["delta"]["content"].setString(state->piece);
-                response->json["created"].setLong(timespec_real().tv_sec);
-                response->content = make_event(response->json);
-                choice.getObject().erase("delta");
-                if (!send_response_chunk(response->content))
-                    return false;
+                if (!ends_with_incomplete_utf8(state->piece)) {
+                    char* p = append_http_response_message(obuf_.p, 200);
+                    choice["delta"]["content"] = state->piece;
+                    response->json["created"] = timespec_real().tv_sec;
+                    response->content = make_event(response->json);
+                    choice.getObject().erase("delta");
+                    if (!send_response_chunk(response->content))
+                        return false;
+                    state->piece.clear();
+                }
             } else {
                 response->content += state->piece;
+                state->piece.clear();
             }
         }
     }
-    choice["finish_reason"].setString(finish_reason);
+    choice["finish_reason"] = finish_reason;
+    SLOG("predicted %d tokens finished on %s", //
+         completion_tokens,
+         finish_reason);
 
     // finalize response
     cleanup_slot(this);
     if (params->stream) {
-        choice["delta"].setObject();
-        choice["delta"]["content"].setString("");
-        response->json["created"].setLong(timespec_real().tv_sec);
+        choice["delta"]["content"] = "";
+        response->json["created"] = timespec_real().tv_sec;
+        if (params->stream_include_usage) {
+            Json& usage = response->json["usage"];
+            usage["prompt_tokens"] = prompt_tokens;
+            usage["completion_tokens"] = completion_tokens;
+            usage["total_tokens"] = completion_tokens + prompt_tokens;
+        }
         response->content = make_event(response->json);
         choice.getObject().erase("delta");
         if (!send_response_chunk(response->content))
             return false;
+        if (!send_response_chunk("data: [DONE]\n\n"))
+            return false;
         return send_response_finish();
     } else {
         Json& usage = response->json["usage"];
-        usage.setObject();
-        usage["prompt_tokens"].setLong(prompt_tokens);
-        usage["completion_tokens"].setLong(completion_tokens);
-        usage["total_tokens"].setLong(completion_tokens + prompt_tokens);
-        choice["message"].setObject();
-        choice["message"]["role"].setString("assistant");
-        choice["message"]["content"].setString(std::move(response->content));
-        response->json["created"].setLong(timespec_real().tv_sec);
+        usage["prompt_tokens"] = prompt_tokens;
+        usage["completion_tokens"] = completion_tokens;
+        usage["total_tokens"] = completion_tokens + prompt_tokens;
+        choice["message"]["role"] = "assistant";
+        choice["message"]["content"] = std::move(response->content);
+        response->json["created"] = timespec_real().tv_sec;
         char* p = append_http_response_message(obuf_.p, 200);
         p = stpcpy(p, "Content-Type: application/json\r\n");
         response->content = response->json.toStringPretty();

@@ -44,6 +44,7 @@ struct Slot;
 struct Worker;
 struct TokenizeParams;
 struct EmbeddingParams;
+struct V1CompletionParams;
 struct V1ChatCompletionParams;
 
 struct Client
@@ -66,6 +67,7 @@ struct Client
     char* params_memory_ = nullptr;
     std::string_view payload_;
     std::string resolved_;
+    std::string dump_;
     Cleanup* cleanups_;
     Buffer ibuf_;
     Buffer obuf_;
@@ -83,6 +85,7 @@ struct Client
     bool read_content() __wur;
     bool send_continue() __wur;
     bool send(const std::string_view) __wur;
+    bool send_binary(const void*, size_t) __wur;
     void defer_cleanup(void (*)(void*), void*);
     bool send_error(int, const char* = nullptr);
     char* append_http_response_message(char*, int, const char* = nullptr);
@@ -108,10 +111,20 @@ struct Client
     bool embedding() __wur;
     bool get_embedding_params(EmbeddingParams*) __wur;
 
+    bool v1_completions() __wur;
+    bool get_v1_completions_params(V1CompletionParams*) __wur;
+
     bool v1_chat_completions() __wur;
     bool get_v1_chat_completions_params(V1ChatCompletionParams*) __wur;
 
+    bool v1_models() __wur;
+
     bool slotz() __wur;
+    bool flagz() __wur;
+    bool db_chat(int64_t) __wur;
+    bool db_chats() __wur;
+    bool db_message(int64_t) __wur;
+    bool db_messages(int64_t) __wur;
 };
 
 } // namespace server

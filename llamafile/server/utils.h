@@ -20,6 +20,7 @@
 #include <__fwd/string_view.h>
 #include <__fwd/vector.h>
 #include <optional>
+#include <sys/uio.h>
 
 struct llama_model;
 
@@ -28,7 +29,8 @@ namespace server {
 
 class Atom;
 
-extern const signed char kHexToInt[256];
+ssize_t
+safe_writev(int, const iovec*, int);
 
 bool
 atob(std::string_view, bool);
@@ -41,6 +43,15 @@ atomize(const llama_model* model,
         std::vector<Atom>* result,
         std::string_view s,
         bool parse_special);
+
+std::vector<Atom>
+remove_old_image_atoms(const std::vector<Atom>&);
+
+int
+count_tokens(const std::vector<Atom>&);
+
+bool
+ends_with_incomplete_utf8(const std::string& str);
 
 } // namespace server
 } // namespace lf

@@ -26,7 +26,7 @@
 #include "llama.cpp/llama.h"
 #include "llamafile/bestline.h"
 #include "llamafile/color.h"
-#include "llamafile/highlight.h"
+#include "llamafile/highlight/highlight.h"
 #include "llamafile/llama.h"
 
 namespace lf {
@@ -98,25 +98,40 @@ bool out_of_context(int extra) {
 void repl() {
 
     // setup conversation
-    if (llama_should_add_bos_token(g_model))
+    if (llama_should_add_bos_token(g_model)) {
+        print_ephemeral("loading bos token...");
         eval_token(llama_token_bos(g_model));
+    }
     record_undo();
 
+    // make base models have no system prompt by default
+    if (is_base_model() && g_params.prompt == DEFAULT_SYSTEM_PROMPT)
+        g_params.prompt = "";
+
     // setup system prompt
-    std::vector<llama_chat_msg> chat = {{"system", g_params.prompt}};
-    std::string msg =
-        llama_chat_apply_template(g_model, g_params.chat_template, chat, DONT_ADD_ASSISTANT);
-    if (!eval_string(msg, DONT_ADD_SPECIAL, PARSE_SPECIAL))
-        exit(6);
-    llama_synchronize(g_ctx);
-    g_system_prompt_tokens = tokens_used();
-    clear_ephemeral();
-    if (g_params.display_prompt)
-        printf("%s\n", g_params.special ? msg.c_str() : g_params.prompt.c_str());
+    if (!g_params.prompt.empty()) {
+        print_ephemeral("loading system prompt...");
+        std::string msg;
+        if (is_base_model()) {
+            msg = g_params.prompt;
+        } else {
+            std::vector<llama_chat_msg> chat = {{"system", g_params.prompt}};
+            msg = llama_chat_apply_template(g_model, g_params.chat_template, chat,
+                                            DONT_ADD_ASSISTANT);
+        }
+        if (!eval_string(msg, DONT_ADD_SPECIAL, PARSE_SPECIAL))
+            exit(6);
+        llama_synchronize(g_ctx);
+        g_system_prompt_tokens = tokens_used();
+        clear_ephemeral();
+        if (g_params.display_prompt)
+            printf("%s\n", g_params.special ? msg.c_str() : g_params.prompt.c_str());
+    }
 
     // perform important setup
-    HighlightMarkdown highlighter;
-    ColorBleeder bleeder(&highlighter);
+    HighlightTxt txt;
+    HighlightMarkdown markdown;
+    ColorBleeder bleeder(is_base_model() ? (Highlight *)&txt : (Highlight *)&markdown);
     llama_sampling_context *sampler = llama_sampling_init(g_params.sparams);
     signal(SIGINT, on_sigint);
 
@@ -129,13 +144,14 @@ void repl() {
         bestlineSetCompletionCallback(on_completion);
         write(1, get_role_color(g_role), strlen(get_role_color(g_role)));
         char *line = bestlineWithHistory(">>> ", "llamafile");
-        write(1, UNFOREGROUND, strlen(UNFOREGROUND));
+        write(1, RESET, strlen(RESET));
+        g_last_printed_char = '\n';
         if (!line) {
             if (g_got_sigint)
                 ensure_newline();
             break;
         }
-        if (is_empty(line)) {
+        if (!is_base_model() && is_empty(line)) {
             if (g_manual_mode) {
                 g_role = cycle_role(g_role);
                 write(1, "\033[F", 3);
@@ -150,9 +166,13 @@ void repl() {
         }
         bool add_assi = !g_manual_mode;
         int tokens_used_before = tokens_used();
-        std::vector<llama_chat_msg> chat = {{get_role_name(g_role), line}};
-        std::string msg =
-            llama_chat_apply_template(g_model, g_params.chat_template, chat, add_assi);
+        std::string msg;
+        if (is_base_model()) {
+            msg = line;
+        } else {
+            std::vector<llama_chat_msg> chat = {{get_role_name(g_role), line}};
+            msg = llama_chat_apply_template(g_model, g_params.chat_template, chat, add_assi);
+        }
         if (!eval_string(msg, DONT_ADD_SPECIAL, PARSE_SPECIAL)) {
             rewind(tokens_used_before);
             continue;
